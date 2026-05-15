@@ -104,6 +104,15 @@ def split_into_tiles(image_path, rows=3, cols=3):
 
 def analyze_image_with_yolo(image_path: str):
     try:
+        # Resize image to max 800x800 to save RAM during YOLO inference
+        img = cv2.imread(image_path)
+        if img is not None:
+            h, w = img.shape[:2]
+            if max(h, w) > 800:
+                scale = 800 / max(h, w)
+                img = cv2.resize(img, (int(w * scale), int(h * scale)))
+                cv2.imwrite(image_path, img)
+
         results = model_yolo(image_path)
         
         # Save the annotated image

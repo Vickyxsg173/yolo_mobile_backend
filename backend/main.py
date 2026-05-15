@@ -26,7 +26,11 @@ import cv2
 import numpy as np
 import json
 from itertools import product
+import torch
 from ultralytics import YOLO
+
+# Limit PyTorch threads to reduce RAM usage on free tier servers
+torch.set_num_threads(1)
 
 # Load YOLO model
 model_yolo = YOLO("best.pt")

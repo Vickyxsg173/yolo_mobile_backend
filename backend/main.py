@@ -1,11 +1,13 @@
 def vision_micro_scratch_detector(image_path: str):
     img = cv2.imread(image_path)
+    if img is None:
+        return None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     laplacian = cv2.Laplacian(gray, cv2.CV_64F)
     lap_var = laplacian.var()
 
-    if lap_var > 18:   
+    if lap_var > 35:
         return {
             "status": "DEFECTIVE",
             "confidence": min(0.95, lap_var / 50),
@@ -24,6 +26,10 @@ import cv2
 import numpy as np
 import json
 from itertools import product
+from ultralytics import YOLO
+
+# Load YOLO model
+model_yolo = YOLO("best.pt")
 
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -46,6 +52,8 @@ latest_result = None
 
 def preprocess_for_micro_defects(image_path: str):
     img = cv2.imread(image_path)
+    if img is None:
+        return image_path
 
     img = cv2.resize(img, (0, 0), fx=0.7, fy=0.7)
 
@@ -63,13 +71,16 @@ def preprocess_for_micro_defects(image_path: str):
 
     enhanced_rgb = cv2.cvtColor(gradient, cv2.COLOR_GRAY2BGR)
 
-    enhanced_path = image_path.replace(".", "_enhanced.")
+    base, ext = os.path.splitext(image_path)
+    enhanced_path = f"{base}_enhanced{ext}"
     cv2.imwrite(enhanced_path, enhanced_rgb)
 
     return enhanced_path
 
 def split_into_tiles(image_path, rows=3, cols=3):
     img = cv2.imread(image_path)
+    if img is None:
+        return []
     h, w, _ = img.shape
 
     tiles = []
@@ -80,13 +91,62 @@ def split_into_tiles(image_path, rows=3, cols=3):
             r * tile_h : (r + 1) * tile_h,
             c * tile_w : (c + 1) * tile_w
         ]
-        tile_path = image_path.replace(
-            ".", f"_tile_{r}_{c}."
-        )
+        base, ext = os.path.splitext(image_path)
+        tile_path = f"{base}_tile_{r}_{c}{ext}"
         cv2.imwrite(tile_path, tile)
         tiles.append(tile_path)
 
     return tiles
+
+def analyze_image_with_yolo(image_path: str):
+    try:
+        results = model_yolo(image_path)
+        
+        # Save the annotated image
+        base, ext = os.path.splitext(image_path)
+        annotated_path = f"{base}_annotated{ext}"
+        results[0].save(filename=annotated_path)
+        annotated_filename = os.path.basename(annotated_path)
+        
+        detections = results[0].boxes
+        
+        has_defect = False
+        max_defect_conf = 0.0
+        defect_count = 0
+        
+        if len(detections) > 0:
+            for box in detections:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                if cls_id == 0:  # 0 is 'damaged', 1 is 'intact'
+                    has_defect = True
+                    defect_count += 1
+                    if conf > max_defect_conf:
+                        max_defect_conf = conf
+
+        if has_defect:
+            return {
+                "status": "DEFECTIVE",
+                "confidence": round(max_defect_conf, 2),
+                "reason": f"Detected {defect_count} defect(s) using YOLO model.",
+                "annotated_image": annotated_filename
+            }
+        else:
+            # Maybe detected intact, or nothing
+            return {
+                "status": "INTACT",
+                "confidence": 0.95,
+                "reason": "No defects detected by YOLO model.",
+                "annotated_image": annotated_filename
+            }
+    except Exception as e:
+        print("YOLO Inference error:", e)
+        return {
+            "status": "INTACT",
+            "confidence": 0.4,
+            "reason": f"YOLO Inference error: {str(e)}",
+            "annotated_image": None
+        }
 
 def analyze_image_with_llm(image_path: str):
     try:
@@ -106,13 +166,14 @@ def analyze_image_with_llm(image_path: str):
                 image_bytes = img.read()
 
             prompt = (
-                "You are a MICRO-DEFECT inspection AI for glossy glass surfaces.\n"
-                "- Assume strong lighting reflections.\n"
-                "- Treat ANY scratch, hairline mark, scuff, swirl, or reflection break as DEFECTIVE.\n"
-                "- If uncertain, mark DEFECTIVE.\n\n"
+                "You are a precision micro-defect inspection AI for mobile glass screens.\n"
+                "- Ignore normal lighting reflections and glare.\n"
+                "- Only classify as DEFECTIVE if there is a clear, continuous scratch, crack, deep scuff, or physical damage.\n"
+                "- Minor noise, dust, or light reflection lines are NOT defects.\n"
+                "- If uncertain, classify as INTACT.\n\n"
                 "Respond ONLY in strict JSON:\n"
                 "{ \"status\": \"DEFECTIVE or INTACT\", "
-                "\"confidence\": number between 0.75 and 1.0, "
+                "\"confidence\": number between 0.5 and 1.0, "
                 "\"reason\": short technical explanation }\n"
             )
 
@@ -126,7 +187,13 @@ def analyze_image_with_llm(image_path: str):
                 ]
             )
 
-            return json.loads(response.text)
+            text = response.text.strip()
+
+            # Remove markdown code fences if present
+            if text.startswith("```"):
+                text = text.split("```")[1]
+
+            return json.loads(text)
 
         results = []
 
@@ -136,25 +203,32 @@ def analyze_image_with_llm(image_path: str):
             except Exception:
                 continue
 
-        for r in results:
-            if r.get("status") == "DEFECTIVE":
-                return {
-                    "status": "DEFECTIVE",
-                    "confidence": r.get("confidence", 0.8),
-                    "reason": r.get("reason", "Micro surface defect detected")
-                }
+        # ---- VOTING LOGIC (reduce false positives) ----
+        defective_results = [
+            r for r in results
+            if r.get("status") == "DEFECTIVE" and r.get("confidence", 0) >= 0.7
+        ]
+
+        # Require at least 3 strong defective tiles
+        if len(defective_results) >= 3:
+            avg_conf = sum(r.get("confidence", 0.8) for r in defective_results) / len(defective_results)
+            return {
+                "status": "DEFECTIVE",
+                "confidence": round(avg_conf, 2),
+                "reason": "Multiple tiles confirmed physical surface damage"
+            }
 
         return {
             "status": "INTACT",
-            "confidence": 0.75,
-            "reason": "No visible surface defects after tiled inspection"
+            "confidence": 0.85,
+            "reason": "No consistent multi-tile physical defects detected"
         }
 
     except Exception as e:
         return {
-            "status": "DEFECTIVE",
-            "confidence": 0.6,
-            "reason": f"Inspection uncertainty fallback: {str(e)}"
+            "status": "INTACT",
+            "confidence": 0.4,
+            "reason": f"Inspection fallback (LLM error): {str(e)}"
         }
 
 @app.post("/upload/")
@@ -167,13 +241,26 @@ async def upload(file: UploadFile = File(...)):
     with open(path, "wb") as f:
         f.write(await file.read())
 
-    analysis = analyze_image_with_llm(path)
+    try:
+        # Priority: YOLO model
+        analysis = analyze_image_with_yolo(path)
+        
+        # Fallback to LLM only if YOLO is unsure or we want more details?
+        # For now, let's stick to YOLO as requested.
+    except Exception as e:
+        analysis = {
+            "status": "INTACT",
+            "confidence": 0.3,
+            "reason": f"Backend processing fallback: {str(e)}",
+            "annotated_image": None
+        }
 
     latest_result = {
         "image": filename,
         "status": analysis["status"],
         "confidence": analysis["confidence"],
-        "reason": analysis["reason"]
+        "reason": analysis["reason"],
+        "annotated_image": analysis.get("annotated_image")
     }
 
     return {"message": "Uploaded"}
